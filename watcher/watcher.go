@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -54,6 +55,16 @@ var defaultIgnoreDirs = map[string]bool{
 	"bin":          true,
 	"obj":          true,
 	".vscode":      true,
+}
+
+// isIgnoredPath returns true if any path segment matches a defaultIgnoreDirs entry.
+func isIgnoredPath(path string) bool {
+	for _, seg := range strings.Split(filepath.ToSlash(path), "/") {
+		if defaultIgnoreDirs[seg] {
+			return true
+		}
+	}
+	return false
 }
 
 // DetectWatchMode inspects a task command and determines the appropriate watch mode.
@@ -167,33 +178,43 @@ func (w *Watcher) Watch(tc config.TaskConfig, workspaceRoot string, onChange OnC
 		}
 	}
 
-	for _, wp := range watchPaths {
-		root := wp
-		if !filepath.IsAbs(root) {
-			root = filepath.Join(workspaceRoot, root)
-		}
-		// Walk and add directories recursively
-		filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
-			if err != nil {
-				return nil
-			}
-			if info.IsDir() {
-				base := filepath.Base(path)
-				if defaultIgnoreDirs[base] {
-					return filepath.SkipDir
-				}
-				fsw.Add(path)
-			}
-			return nil
-		})
-	}
-
-	// Start event loop
+	// Start event loop immediately (handles events as dirs are added)
 	go tw.eventLoop(w.debounce)
 
 	w.mu.Lock()
 	w.watchers[tc.Label] = tw
 	w.mu.Unlock()
+
+	// Walk and add directories in the background so we don't block startup.
+	// We yield every 50 directories so the Go scheduler can run other
+	// goroutines (e.g. the TUI log reader) during a large workspace walk.
+	go func() {
+		const yieldEvery = 50
+		var count int
+		for _, wp := range watchPaths {
+			root := wp
+			if !filepath.IsAbs(root) {
+				root = filepath.Join(workspaceRoot, root)
+			}
+			filepath.Walk(root, func(path string, info os.FileInfo, err error) error {
+				if err != nil {
+					return nil
+				}
+				if info.IsDir() {
+					base := filepath.Base(path)
+					if defaultIgnoreDirs[base] {
+						return filepath.SkipDir
+					}
+					fsw.Add(path)
+					count++
+					if count%yieldEvery == 0 {
+						runtime.Gosched()
+					}
+				}
+				return nil
+			})
+		}
+	}()
 
 	return nil
 }
@@ -210,6 +231,11 @@ func (tw *taskWatcher) eventLoop(debounce time.Duration) {
 			enabled := tw.enabled
 			tw.mu.Unlock()
 			if !enabled {
+				continue
+			}
+
+			// Filter out events inside ignored directories (e.g. node_modules, .git)
+			if isIgnoredPath(event.Name) {
 				continue
 			}
 

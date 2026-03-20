@@ -87,15 +87,17 @@ func main() {
 	r := runner.New(tasksToRun)
 	r.StartAll()
 
-	// 6. Start file watchers
+	// 6. Start file watchers (in background so TUI starts immediately)
 	w := watcher.New(*debounce)
-	for _, tc := range tasksToRun {
-		if err := w.Watch(tc, workspaceRoot, func(label string) {
-			r.RestartTask(label)
-		}); err != nil {
-			fmt.Fprintf(os.Stderr, "[taskr] warning: could not watch files for %s: %v\n", tc.Label, err)
+	go func() {
+		for _, tc := range tasksToRun {
+			if err := w.Watch(tc, workspaceRoot, func(label string) {
+				r.RestartTask(label)
+			}); err != nil {
+				fmt.Fprintf(os.Stderr, "[taskr] warning: could not watch files for %s: %v\n", tc.Label, err)
+			}
 		}
-	}
+	}()
 
 	// 7. Launch TUI
 	model := tui.NewModel(r,
