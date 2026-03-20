@@ -1,6 +1,6 @@
 {
   "name": "altlimit-taskr",
-  "displayName": "TaskR",
+  "displayName": "TaskR - Unified Task Logs",
   "description": "Run VSCode tasks with taskr - concurrent execution, colored logs, file watching, and an interactive TUI",
   "version": "0.1.0",
   "icon": "icon.png",
