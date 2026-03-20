@@ -1,0 +1,15 @@
+# Go binaries
+/taskr.exe
+/taskr
+
+# VSCode workspace settings (sample, not project config)
+/.vscode
+
+# Extension build artifacts
+vscode-taskr/node_modules/
+vscode-taskr/out/
+vscode-taskr/*.vsix
+
+# OS
+.DS_Store
+Thumbs.db

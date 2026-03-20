@@ -1,0 +1,150 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+jobs:
+  # Build Go binaries for all platforms
+  build-binaries:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        include:
+          - goos: linux
+            goarch: amd64
+          - goos: linux
+            goarch: arm64
+          - goos: darwin
+            goarch: amd64
+          - goos: darwin
+            goarch: arm64
+          - goos: windows
+            goarch: amd64
+          - goos: windows
+            goarch: arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+        run: |
+          EXT=""
+          if [ "$GOOS" = "windows" ]; then EXT=".exe"; fi
+          OUTPUT="taskr_${GOOS}_${GOARCH}${EXT}"
+          VERSION="0.1.${{ github.run_number }}"
+          go build -ldflags="-s -w -X main.version=${VERSION}" -o "$OUTPUT" .
+          echo "ARTIFACT=$OUTPUT" >> $GITHUB_ENV
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: taskr_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: ${{ env.ARTIFACT }}
+
+  # Run tests
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+
+      - name: Test
+        run: go test ./...
+
+  # Build VSCode extension
+  build-extension:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Set version
+        working-directory: vscode-taskr
+        run: npm version "0.1.${{ github.run_number }}" --no-git-tag-version
+
+      - name: Install dependencies
+        working-directory: vscode-taskr
+        run: npm ci
+
+      - name: Compile TypeScript
+        working-directory: vscode-taskr
+        run: npx tsc -p ./
+
+      - name: Copy LICENSE
+        run: cp LICENSE vscode-taskr/LICENSE
+
+      - name: Package VSIX
+        working-directory: vscode-taskr
+        run: npx @vscode/vsce package --no-dependencies -o taskr.vsix
+
+      - name: Upload VSIX
+        uses: actions/upload-artifact@v4
+        with:
+          name: taskr-vsix
+          path: vscode-taskr/taskr.vsix
+
+  # Create GitHub Release with all artifacts
+  release:
+    needs: [test, build-binaries, build-extension]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Prepare release assets
+        run: |
+          mkdir -p release
+          for dir in artifacts/taskr_*/; do
+            cp "$dir"* release/
+          done
+          cp artifacts/taskr-vsix/taskr.vsix release/
+
+      - name: Create Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v0.1.${{ github.run_number }}
+          name: v0.1.${{ github.run_number }}
+          generate_release_notes: true
+          files: release/*
+
+  # Publish VSCode extension to marketplace (optional, needs PAT)
+  publish-extension:
+    needs: [build-extension, test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Download VSIX
+        uses: actions/download-artifact@v4
+        with:
+          name: taskr-vsix
+          path: .
+
+      - name: Publish to VS Code Marketplace
+        run: npx @vscode/vsce publish --packagePath taskr.vsix
+        env:
+          VSCE_PAT: ${{ secrets.VSCE_PAT }}

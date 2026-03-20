@@ -1,0 +1,45 @@
+{
+  "name": "taskr",
+  "displayName": "TaskR",
+  "description": "Run VSCode tasks with taskr - concurrent execution, colored logs, file watching, and an interactive TUI",
+  "version": "0.1.0",
+  "publisher": "altlimit",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/altlimit/taskr"
+  },
+  "engines": {
+    "vscode": "^1.85.0"
+  },
+  "categories": ["Other"],
+  "activationEvents": [
+    "workspaceContains:.vscode/tasks.json"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "commands": [
+      {
+        "command": "taskr.run",
+        "title": "TaskR: Run Tasks"
+      }
+    ],
+    "keybindings": [
+      {
+        "command": "taskr.run",
+        "key": "ctrl+shift+t",
+        "mac": "cmd+shift+t"
+      }
+    ]
+  },
+  "scripts": {
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "package": "vsce package"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.85.0",
+    "@types/node": "^20.0.0",
+    "typescript": "^5.3.0",
+    "@vscode/vsce": "^2.22.0"
+  }
+}
