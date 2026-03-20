@@ -329,6 +329,12 @@ func (r *Runner) emitLog(label, stream, content string) {
 	}
 }
 
+// Log emits a message into the shared log channel under the given task label.
+// Use label "taskr" for system-level messages.
+func (r *Runner) Log(label, content string) {
+	r.emitLog(label, "stdout", content)
+}
+
 // RestartTask kills and restarts a single task.
 func (r *Runner) RestartTask(label string) {
 	mt, ok := r.tasks[label]
@@ -347,6 +353,81 @@ func (r *Runner) RestartTask(label string) {
 
 	// Restart
 	go r.startTask(mt)
+}
+
+// Reload applies a new set of task configs without restarting the process.
+// Tasks that no longer exist are stopped. New tasks are started. Tasks whose
+// configs have changed are restarted. The TUI channels remain open throughout.
+func (r *Runner) Reload(newConfigs []config.TaskConfig) {
+	// Build a lookup for new configs
+	newMap := make(map[string]config.TaskConfig, len(newConfigs))
+	for _, c := range newConfigs {
+		newMap[c.Label] = c
+	}
+
+	// Collect work under the lock — no blocking calls while holding it.
+	r.mu.Lock()
+	var toStop []struct {
+		label string
+		mt    *managedTask
+	}
+	for label, mt := range r.tasks {
+		if _, exists := newMap[label]; !exists {
+			toStop = append(toStop, struct {
+				label string
+				mt    *managedTask
+			}{label, mt})
+		}
+	}
+
+	var toRestart []*managedTask
+	var toStart []*managedTask
+	for _, c := range newConfigs {
+		c := c
+		if mt, exists := r.tasks[c.Label]; exists {
+			if fmt.Sprintf("%+v", mt.config) != fmt.Sprintf("%+v", c) {
+				mt.config = c
+				mt.state.Config = c
+				toRestart = append(toRestart, mt)
+			}
+		} else {
+			mt := &managedTask{
+				config: c,
+				state: &config.TaskState{
+					Config: c,
+					Status: config.StatusPending,
+				},
+			}
+			r.tasks[c.Label] = mt
+			r.taskOrder = append(r.taskOrder, c.Label)
+			toStart = append(toStart, mt)
+		}
+	}
+	r.mu.Unlock()
+
+	// Stop removed tasks and clean them up.
+	for _, item := range toStop {
+		r.emitLog(item.label, "stdout", "[taskr] task removed by config reload, stopping...")
+		r.killTask(item.mt)
+		r.mu.Lock()
+		delete(r.tasks, item.label)
+		for i, l := range r.taskOrder {
+			if l == item.label {
+				r.taskOrder = append(r.taskOrder[:i], r.taskOrder[i+1:]...)
+				break
+			}
+		}
+		r.mu.Unlock()
+	}
+
+	for _, mt := range toRestart {
+		r.emitLog(mt.config.Label, "stdout", "[taskr] config changed, restarting...")
+		r.RestartTask(mt.config.Label)
+	}
+	for _, mt := range toStart {
+		r.emitLog(mt.config.Label, "stdout", "[taskr] new task added by config reload, starting...")
+		go r.startTask(mt)
+	}
 }
 
 // RestartAll restarts all tasks.

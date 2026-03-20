@@ -30,7 +30,18 @@
         "key": "ctrl+shift+t",
         "mac": "cmd+shift+t"
       }
-    ]
+    ],
+    "configuration": {
+      "title": "TaskR",
+      "properties": {
+        "taskr.terminal": {
+          "type": "string",
+          "enum": ["integrated", "external"],
+          "default": "integrated",
+          "description": "Where to launch taskr: in the VSCode integrated terminal or in a new external terminal window."
+        }
+      }
+    }
   },
   "scripts": {
     "compile": "tsc -p ./",

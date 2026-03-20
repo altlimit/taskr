@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"sync/atomic"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
@@ -17,6 +18,10 @@ import (
 )
 
 var version = "dev"
+
+// tuiProgram is set once the Bubble Tea program is running so that background
+// goroutines (e.g. config watcher) can safely call p.Send.
+var tuiProgram atomic.Pointer[tea.Program]
 
 func main() {
 	showVersion := flag.Bool("v", false, "Show version")
@@ -93,11 +98,54 @@ func main() {
 		for _, tc := range tasksToRun {
 			if err := w.Watch(tc, workspaceRoot, func(label string) {
 				r.RestartTask(label)
+				if p := tuiProgram.Load(); p != nil {
+					p.Send(tui.ClearURLsMsg{Label: label})
+				}
 			}); err != nil {
 				fmt.Fprintf(os.Stderr, "[taskr] warning: could not watch files for %s: %v\n", tc.Label, err)
 			}
 		}
 	}()
+
+	// Watch tasks.json itself — reload all tasks when the config changes.
+	if err := w.WatchConfig(tasksPath, func() {
+		newAllTasks, err := parser.Parse(tasksPath, workspaceRoot)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "[taskr] warning: tasks.json reload failed: %v\n", err)
+			return
+		}
+		// Re-resolve each originally-selected label. If a label or one of its
+		// transitive deps was removed, log a warning in the TUI and skip it —
+		// Reload will stop any tasks that are no longer in newTasks.
+		seen := map[string]bool{}
+		var newTasks []config.TaskConfig
+		for _, l := range taskLabels {
+			resolved, err := parser.ResolveDependencies(l, newAllTasks)
+			if err != nil {
+				r.Log("taskr", fmt.Sprintf("[taskr] warning: skipping %q after config reload: %v", l, err))
+				continue
+			}
+			for _, t := range resolved {
+				if !seen[t.Label] {
+					seen[t.Label] = true
+					if *noWatch {
+						t.WatchMode = config.WatchNone
+						t.WatchEnabled = false
+					} else {
+						watcher.DetectWatchMode(&t)
+					}
+					newTasks = append(newTasks, t)
+				}
+			}
+		}
+		r.Reload(newTasks)
+		// Notify the TUI to refresh its tabs and URL bar.
+		if p := tuiProgram.Load(); p != nil {
+			p.Send(tui.ReloadMsg{Labels: r.TaskOrder()})
+		}
+	}); err != nil {
+		fmt.Fprintf(os.Stderr, "[taskr] warning: could not watch tasks.json: %v\n", err)
+	}
 
 	// 7. Launch TUI
 	model := tui.NewModel(r,
@@ -105,6 +153,7 @@ func main() {
 		func(label string) bool { return w.IsEnabled(label) },
 	)
 	p := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
+	tuiProgram.Store(p)
 
 	if _, err := p.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "TUI error: %v\n", err)

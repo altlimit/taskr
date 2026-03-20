@@ -22,6 +22,14 @@ const maxLogLines = 10000
 type logLineMsg config.LogLine
 type capturedURLMsg runner.CapturedURL
 
+// ReloadMsg is sent to the TUI when tasks.json is reloaded so the tab bar,
+// URL bar and task index are updated to reflect the new set of running tasks.
+type ReloadMsg struct{ Labels []string }
+
+// ClearURLsMsg clears pinned URLs for a specific task label.
+// If Label is empty, all URLs are cleared.
+type ClearURLsMsg struct{ Label string }
+
 // --- Styles ---
 
 var (
@@ -237,11 +245,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				label := m.taskLabels[m.activeTab]
 				if m.canRestart(label) {
 					m.markRestart(label)
+					m.clearURLs(label)
 					m.runner.RestartTask(label)
 				}
 			} else {
 				if m.canRestart("__all__") {
 					m.markRestart("__all__")
+					m.clearURLs("")
 					m.runner.RestartAll()
 				}
 			}
@@ -249,6 +259,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "R":
 			if m.canRestart("__all__") {
 				m.markRestart("__all__")
+				m.clearURLs("")
 				m.runner.RestartAll()
 			}
 
@@ -322,11 +333,43 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		cmds = append(cmds, waitForLog(m.runner.LogCh()))
 
+	case ClearURLsMsg:
+		m.clearURLs(msg.Label)
+		m.resizeViewport()
+
 	case capturedURLMsg:
 		url := runner.CapturedURL(msg)
 		m.addURL(url.TaskLabel, url.URL)
 		m.resizeViewport() // URL bar changed height
 		cmds = append(cmds, waitForURL(m.runner.URLCh()))
+
+	case ReloadMsg:
+		// Rebuild task list and index from the new label set.
+		m.taskLabels = msg.Labels
+		newIndex := make(map[string]int, len(msg.Labels))
+		for i, l := range msg.Labels {
+			newIndex[l] = i
+		}
+		m.taskIndex = newIndex
+
+		// Clear URLs for tasks that were restarted or removed.
+		var newURLOrder []string
+		for _, l := range m.urlOrder {
+			if _, ok := newIndex[l]; ok {
+				newURLOrder = append(newURLOrder, l)
+			} else {
+				delete(m.capturedURLs, l)
+			}
+		}
+		m.urlOrder = newURLOrder
+
+		// Clamp activeTab so it stays valid.
+		if m.activeTab >= len(m.taskLabels) {
+			m.activeTab = len(m.taskLabels) - 1
+		}
+
+		m.resizeViewport()
+		m.refreshViewport()
 	}
 
 	return m, tea.Batch(cmds...)
@@ -364,6 +407,24 @@ func (m *Model) appendLog(line config.LogLine) {
 		copy(m.allLogs, m.allLogs[len(m.allLogs)-maxLogLines:])
 		m.allLogs = m.allLogs[:maxLogLines]
 	}
+}
+
+// clearURLs removes captured URLs for a task so the URL bar is fresh after a
+// restart. Pass an empty label to clear all tasks' URLs.
+func (m *Model) clearURLs(label string) {
+	if label == "" {
+		m.capturedURLs = make(map[string][]string)
+		m.urlOrder = nil
+	} else {
+		delete(m.capturedURLs, label)
+		for i, l := range m.urlOrder {
+			if l == label {
+				m.urlOrder = append(m.urlOrder[:i], m.urlOrder[i+1:]...)
+				break
+			}
+		}
+	}
+	m.resizeViewport()
 }
 
 func (m *Model) addURL(label, url string) {

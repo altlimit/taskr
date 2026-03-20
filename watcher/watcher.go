@@ -306,6 +306,56 @@ func (w *Watcher) IsEnabled(label string) bool {
 	return tw.enabled
 }
 
+// WatchConfig watches a single config file (e.g. tasks.json) and calls
+// onChange whenever it is written. The watcher runs until Shutdown is called.
+func (w *Watcher) WatchConfig(filePath string, onChange func()) error {
+	fsw, err := fsnotify.NewWatcher()
+	if err != nil {
+		return err
+	}
+	if err := fsw.Add(filePath); err != nil {
+		fsw.Close()
+		return err
+	}
+
+	tw := &taskWatcher{
+		label:     "__config__",
+		fsWatcher: fsw,
+		enabled:   true,
+		done:      make(chan struct{}),
+	}
+
+	w.mu.Lock()
+	w.watchers["__config__"] = tw
+	w.mu.Unlock()
+
+	go func() {
+		var timer *time.Timer
+		for {
+			select {
+			case event, ok := <-fsw.Events:
+				if !ok {
+					return
+				}
+				if event.Op&(fsnotify.Write|fsnotify.Create) == 0 {
+					continue
+				}
+				if timer != nil {
+					timer.Stop()
+				}
+				timer = time.AfterFunc(w.debounce, onChange)
+			case _, ok := <-fsw.Errors:
+				if !ok {
+					return
+				}
+			case <-tw.done:
+				return
+			}
+		}
+	}()
+	return nil
+}
+
 // Shutdown stops all watchers.
 func (w *Watcher) Shutdown() {
 	w.mu.Lock()

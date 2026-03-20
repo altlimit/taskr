@@ -82,18 +82,71 @@ export function activate(context: vscode.ExtensionContext) {
             return; // Error already shown
         }
 
-        // 4. Launch in integrated terminal
-        //    Use & operator on PowerShell to handle special chars in args (parentheses, etc.)
-        const shellArgs = selectedLabels.map(l => `"${l}"`).join(' ');
-        const terminal = vscode.window.createTerminal({
-            name: `TaskR: ${selectedLabels.join(', ')}`,
-            cwd: workspaceFolder.uri.fsPath,
-        });
-        terminal.show();
-        terminal.sendText(`& "${binaryPath}" ${shellArgs}`);
+        const cwd = workspaceFolder.uri.fsPath;
+
+        // 4. Launch — integrated or external terminal based on setting
+        const terminalPref = vscode.workspace.getConfiguration('taskr').get<string>('terminal', 'integrated');
+        if (terminalPref === 'external') {
+            launchExternal(binaryPath, selectedLabels, cwd);
+        } else {
+            // Integrated terminal: use single-quoted args so PowerShell handles
+            // labels with spaces, parentheses, colons etc. without parse errors.
+            const psArgs = selectedLabels.map(l => `'${l.replace(/'/g, "''")}'`).join(' ');
+            const terminal = vscode.window.createTerminal({
+                name: `TaskR: ${selectedLabels.join(', ')}`,
+                cwd,
+            });
+            terminal.show();
+            terminal.sendText(`& '${binaryPath.replace(/'/g, "''")}' ${psArgs}`);
+        }
     });
 
     context.subscriptions.push(command);
+}
+
+/**
+ * Open an external terminal window and run the given command string in it.
+ * Tries the most capable terminal available on each platform.
+ */
+function launchExternal(binaryPath: string, labels: string[], cwd: string): void {
+    // Build a PowerShell-safe command using single quotes (handles spaces,
+    // parentheses, colons in label names without parse errors).
+    const psBin  = binaryPath.replace(/'/g, "''");
+    const psArgs = labels.map(l => `'${l.replace(/'/g, "''")}'`).join(' ');
+    const psCmd  = `& '${psBin}' ${psArgs}`;
+
+    if (process.platform === 'win32') {
+        const wtPath = findOnPath('wt');
+        let spawnCmd: string;
+        if (wtPath) {
+            // Windows Terminal: pass the PS command as a quoted -Command argument
+            spawnCmd = `wt -d "${cwd}" powershell -NoExit -Command "${psCmd.replace(/"/g, '\\"')}"`;
+        } else {
+            // Fallback: open a new PowerShell window
+            spawnCmd = `start powershell -NoExit -Command "${psCmd.replace(/"/g, '\\"')}"`;
+        }
+        exec(spawnCmd, { cwd });
+    } else if (process.platform === 'darwin') {
+        const shCmd = `cd '${cwd}' && '${psBin}' ${labels.map(l => `'${l.replace(/'/g, "'\\''")}'`).join(' ')}`;
+        const script = `tell application "Terminal" to do script "${shCmd}"`;
+        exec(`osascript -e '${script}'`);
+    } else {
+        // Linux: try common terminal emulators in order of preference
+        const shCmd = `cd '${cwd}' && '${psBin}' ${labels.map(l => `'${l.replace(/'/g, "'\\''")}'`).join(' ')}; exec bash`;
+        const terminals = [
+            { bin: 'gnome-terminal', args: ['--', 'bash', '-c', shCmd] },
+            { bin: 'konsole',        args: ['-e', 'bash', '-c', shCmd] },
+            { bin: 'xfce4-terminal', args: ['-e', `bash -c '${shCmd}'`] },
+            { bin: 'xterm',          args: ['-e', 'bash', '-c', shCmd] },
+        ];
+        const found = terminals.find(t => findOnPath(t.bin));
+        if (found) {
+            const { spawn } = require('child_process');
+            spawn(found.bin, found.args, { cwd, detached: true, stdio: 'ignore' }).unref();
+        } else {
+            vscode.window.showErrorMessage('TaskR: Could not find a terminal emulator (tried gnome-terminal, konsole, xfce4-terminal, xterm).');
+        }
+    }
 }
 
 /**
