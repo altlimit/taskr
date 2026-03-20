@@ -1,8 +1,9 @@
 {
-  "name": "taskr",
+  "name": "altlimit-taskr",
   "displayName": "TaskR",
   "description": "Run VSCode tasks with taskr - concurrent execution, colored logs, file watching, and an interactive TUI",
   "version": "0.1.0",
+  "icon": "icon.png",
   "publisher": "altlimit",
   "repository": {
     "type": "git",
