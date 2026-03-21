@@ -131,20 +131,36 @@ function launchExternal(binaryPath: string, labels: string[], cwd: string): void
         const script = `tell application "Terminal" to do script "${shCmd}"`;
         exec(`osascript -e '${script}'`);
     } else {
-        // Linux: try common terminal emulators in order of preference
+        // Linux / WSL: if we're inside WSL or can't find a GUI terminal, fall
+        // back to the VSCode integrated terminal (always available).
+        const isWsl = !!process.env.WSL_DISTRO_NAME || !!process.env.WSLENV ||
+            (() => {
+                try { return fs.readFileSync('/proc/version', 'utf-8').toLowerCase().includes('microsoft'); }
+                catch { return false; }
+            })();
+
         const shCmd = `cd '${cwd}' && '${psBin}' ${labels.map(l => `'${l.replace(/'/g, "'\\''")}'`).join(' ')}; exec bash`;
         const terminals = [
-            { bin: 'gnome-terminal', args: ['--', 'bash', '-c', shCmd] },
-            { bin: 'konsole',        args: ['-e', 'bash', '-c', shCmd] },
-            { bin: 'xfce4-terminal', args: ['-e', `bash -c '${shCmd}'`] },
-            { bin: 'xterm',          args: ['-e', 'bash', '-c', shCmd] },
+            { bin: 'gnome-terminal',    args: ['--', 'bash', '-c', shCmd] },
+            { bin: 'konsole',           args: ['-e', 'bash', '-c', shCmd] },
+            { bin: 'xfce4-terminal',    args: ['-e', `bash -c '${shCmd}'`] },
+            { bin: 'xterm',             args: ['-e', 'bash', '-c', shCmd] },
+            { bin: 'x-terminal-emulator', args: ['-e', `bash -c '${shCmd}'`] },
         ];
-        const found = terminals.find(t => findOnPath(t.bin));
+
+        const found = !isWsl && terminals.find(t => findOnPath(t.bin));
         if (found) {
             const { spawn } = require('child_process');
             spawn(found.bin, found.args, { cwd, detached: true, stdio: 'ignore' }).unref();
         } else {
-            vscode.window.showErrorMessage('TaskR: Could not find a terminal emulator (tried gnome-terminal, konsole, xfce4-terminal, xterm).');
+            // WSL or no GUI terminal available — use the integrated terminal.
+            const shArgs = labels.map(l => `'${l.replace(/'/g, "'\\''")}'`).join(' ');
+            const terminal = vscode.window.createTerminal({
+                name: `TaskR: ${labels.join(', ')}`,
+                cwd,
+            });
+            terminal.show();
+            terminal.sendText(`'${psBin.replace(/'/g, "'\\''")}' ${shArgs}`);
         }
     }
 }
