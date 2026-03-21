@@ -89,15 +89,20 @@ export function activate(context: vscode.ExtensionContext) {
         if (terminalPref === 'external') {
             launchExternal(binaryPath, selectedLabels, cwd);
         } else {
-            // Integrated terminal: use single-quoted args so PowerShell handles
-            // labels with spaces, parentheses, colons etc. without parse errors.
-            const psArgs = selectedLabels.map(l => `'${l.replace(/'/g, "''")}'`).join(' ');
             const terminal = vscode.window.createTerminal({
                 name: `TaskR: ${selectedLabels.join(', ')}`,
                 cwd,
             });
             terminal.show();
-            terminal.sendText(`& '${binaryPath.replace(/'/g, "''")}' ${psArgs}`);
+            if (process.platform === 'win32') {
+                // PowerShell: use & '...' call operator with ''-escaped single quotes
+                const psArgs = selectedLabels.map(l => `'${l.replace(/'/g, "''")}'`).join(' ');
+                terminal.sendText(`& '${binaryPath.replace(/'/g, "''")}' ${psArgs}`);
+            } else {
+                // bash/zsh (Linux, macOS, WSL Remote): call directly with POSIX quoting
+                const shArgs = selectedLabels.map(l => `'${l.replace(/'/g, "'\\''")}'`).join(' ');
+                terminal.sendText(`'${binaryPath.replace(/'/g, "'\\''")}' ${shArgs}`);
+            }
         }
     });
 
@@ -140,27 +145,71 @@ function launchExternal(binaryPath: string, labels: string[], cwd: string): void
             })();
 
         const shCmd = `cd '${cwd}' && '${psBin}' ${labels.map(l => `'${l.replace(/'/g, "'\\''")}'`).join(' ')}; exec bash`;
-        const terminals = [
-            { bin: 'gnome-terminal',    args: ['--', 'bash', '-c', shCmd] },
-            { bin: 'konsole',           args: ['-e', 'bash', '-c', shCmd] },
-            { bin: 'xfce4-terminal',    args: ['-e', `bash -c '${shCmd}'`] },
-            { bin: 'xterm',             args: ['-e', 'bash', '-c', shCmd] },
-            { bin: 'x-terminal-emulator', args: ['-e', `bash -c '${shCmd}'`] },
-        ];
 
-        const found = !isWsl && terminals.find(t => findOnPath(t.bin));
-        if (found) {
+        if (isWsl) {
+            // From WSL we can invoke Windows executables (wt.exe, wsl.exe) directly
+            // via the WSL interop layer. Two important constraints:
+            //   1. Windows Terminal uses ';' as its own tab-separator, so we must
+            //      NOT put any ';' in the wt.exe argument list — use a temp script.
+            //   2. The WSL cwd (e.g. /home/user/...) becomes a UNC path when seen
+            //      by Windows processes; never pass it as cwd — let the script cd.
             const { spawn } = require('child_process');
-            spawn(found.bin, found.args, { cwd, detached: true, stdio: 'ignore' }).unref();
-        } else {
-            // WSL or no GUI terminal available — use the integrated terminal.
-            const shArgs = labels.map(l => `'${l.replace(/'/g, "'\\''")}'`).join(' ');
-            const terminal = vscode.window.createTerminal({
-                name: `TaskR: ${labels.join(', ')}`,
-                cwd,
+
+            // Write a temp script so there are no quoting or ';' issues in args.
+            const tmpScript = `/tmp/taskr_run_${Date.now()}.sh`;
+            const scriptLines = [
+                // No shebang — bash is invoked explicitly with -l below.
+                // Source ~/.bashrc explicitly: Debian login shells source ~/.profile
+                // but typically NOT ~/.bashrc, so GOPATH/bin etc. would be missing.
+                '[ -f "$HOME/.bashrc" ] && . "$HOME/.bashrc"',
+                `cd '${cwd.replace(/'/g, "'\\''")}'`,
+                `'${psBin.replace(/'/g, "'\\''")}' ${labels.map(l => `'${l.replace(/'/g, "'\\''")}'`).join(' ')}`,
+                'exec bash',
+            ].join('\n');
+            fs.writeFileSync(tmpScript, scriptLines + '\n', { mode: 0o755 });
+
+            // Use the current distro name so the terminal always opens in the
+            // same distro the extension host is running in, not whatever is
+            // currently set as the Windows default.
+            const distroArgs = process.env.WSL_DISTRO_NAME
+                ? ['-d', process.env.WSL_DISTRO_NAME]
+                : [];
+
+            const fallbackToIntegrated = () => {
+                // Last resort: run in the VSCode integrated terminal
+                const shArgs = labels.map(l => `'${l.replace(/'/g, "'\\''")}'`).join(' ');
+                const terminal = vscode.window.createTerminal({ name: `TaskR: ${labels.join(', ')}`, cwd });
+                terminal.show();
+                terminal.sendText(`'${psBin.replace(/'/g, "'\\''")}' ${shArgs}`);
+            };
+
+            const child = spawn('wt.exe', ['wsl.exe', ...distroArgs, 'bash', '-li', tmpScript],
+                { detached: true, stdio: 'ignore' });
+            child.on('error', () => {
+                // wt.exe not available — try a bare WSL console window
+                const child2 = spawn('cmd.exe', ['/c', 'start', 'wsl.exe', ...distroArgs, 'bash', '-li', tmpScript],
+                    { detached: true, stdio: 'ignore' });
+                child2.on('error', fallbackToIntegrated);
+                child2.unref();
             });
-            terminal.show();
-            terminal.sendText(`'${psBin.replace(/'/g, "'\\''")}' ${shArgs}`);
+            child.unref();
+        } else {
+            const terminals = [
+                { bin: 'gnome-terminal',      args: ['--', 'bash', '-c', shCmd] },
+                { bin: 'konsole',             args: ['-e', 'bash', '-c', shCmd] },
+                { bin: 'xfce4-terminal',      args: ['-e', `bash -c '${shCmd}'`] },
+                { bin: 'xterm',               args: ['-e', 'bash', '-c', shCmd] },
+                { bin: 'x-terminal-emulator', args: ['-e', `bash -c '${shCmd}'`] },
+            ];
+            const found = terminals.find(t => findOnPath(t.bin));
+            if (found) {
+                const { spawn } = require('child_process');
+                spawn(found.bin, found.args, { cwd, detached: true, stdio: 'ignore' }).unref();
+            } else {
+                vscode.window.showErrorMessage(
+                    'TaskR: Could not find a terminal emulator (tried gnome-terminal, konsole, xfce4-terminal, xterm, x-terminal-emulator).'
+                );
+            }
         }
     }
 }
