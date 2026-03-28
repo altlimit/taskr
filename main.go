@@ -37,24 +37,46 @@ func main() {
 
 	taskLabels := flag.Args() // Support multiple labels: taskr api web worker
 
-	// 1. Find and parse tasks.json
-	var tasksPath, workspaceRoot string
+	// 1. Find and parse tasks.json (supports nested .vscode/tasks.json)
+	var workspaceRoot string
+	var allTasks []config.TaskConfig
+	var allFoundFiles []parser.FoundTasks
 	var err error
 
 	if *configPath != "" {
-		tasksPath = *configPath
+		// Explicit --config: use only that one file
 		workspaceRoot, _ = os.Getwd()
+		tasks, parseErr := parser.Parse(*configPath, workspaceRoot)
+		if parseErr != nil {
+			log.Fatalf("Error parsing tasks.json: %v", parseErr)
+		}
+		allTasks = tasks
+		allFoundFiles = []parser.FoundTasks{{
+			TasksPath:     *configPath,
+			WorkspaceRoot: workspaceRoot,
+		}}
 	} else {
 		cwd, _ := os.Getwd()
-		tasksPath, workspaceRoot, err = parser.FindTasksJSON(cwd)
+		_, workspaceRoot, err = parser.FindTasksJSON(cwd)
 		if err != nil {
 			log.Fatalf("Error: %v\nRun this from a directory with .vscode/tasks.json, or pass --config", err)
 		}
-	}
 
-	allTasks, err := parser.Parse(tasksPath, workspaceRoot)
-	if err != nil {
-		log.Fatalf("Error parsing tasks.json: %v", err)
+		// Discover all .vscode/tasks.json recursively
+		allFoundFiles = parser.FindAllTasksJSON(workspaceRoot)
+		if len(allFoundFiles) == 0 {
+			log.Fatal("No .vscode/tasks.json found in workspace")
+		}
+
+		for _, found := range allFoundFiles {
+			tasks, parseErr := parser.Parse(found.TasksPath, found.WorkspaceRoot)
+			if parseErr != nil {
+				fmt.Fprintf(os.Stderr, "[taskr] warning: could not parse %s: %v\n", found.TasksPath, parseErr)
+				continue
+			}
+			parser.PrefixTasks(tasks, found.RelPrefix)
+			allTasks = append(allTasks, tasks...)
+		}
 	}
 
 	if len(allTasks) == 0 {
@@ -107,22 +129,31 @@ func main() {
 		}
 	}()
 
-	// Watch tasks.json itself — reload all tasks when the config changes.
-	if err := w.WatchConfig(tasksPath, func() {
-		newAllTasks, err := parser.Parse(tasksPath, workspaceRoot)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "[taskr] warning: tasks.json reload failed: %v\n", err)
-			return
+	// Watch all discovered tasks.json files — reload everything when any changes.
+	reloadAllConfigs := func() {
+		var newAllTasks []config.TaskConfig
+		currentFiles := allFoundFiles
+		if *configPath == "" {
+			// Re-discover in case new projects were added/removed
+			currentFiles = parser.FindAllTasksJSON(workspaceRoot)
 		}
-		// Re-resolve each originally-selected label. If a label or one of its
-		// transitive deps was removed, log a warning in the TUI and skip it —
-		// Reload will stop any tasks that are no longer in newTasks.
+		for _, found := range currentFiles {
+			tasks, parseErr := parser.Parse(found.TasksPath, found.WorkspaceRoot)
+			if parseErr != nil {
+				fmt.Fprintf(os.Stderr, "[taskr] warning: tasks.json reload failed for %s: %v\n", found.TasksPath, parseErr)
+				continue
+			}
+			parser.PrefixTasks(tasks, found.RelPrefix)
+			newAllTasks = append(newAllTasks, tasks...)
+		}
+
+		// Re-resolve each originally-selected label
 		seen := map[string]bool{}
 		var newTasks []config.TaskConfig
 		for _, l := range taskLabels {
-			resolved, err := parser.ResolveDependencies(l, newAllTasks)
-			if err != nil {
-				r.Log("taskr", fmt.Sprintf("[taskr] warning: skipping %q after config reload: %v", l, err))
+			resolved, resolveErr := parser.ResolveDependencies(l, newAllTasks)
+			if resolveErr != nil {
+				r.Log("taskr", fmt.Sprintf("[taskr] warning: skipping %q after config reload: %v", l, resolveErr))
 				continue
 			}
 			for _, t := range resolved {
@@ -139,12 +170,16 @@ func main() {
 			}
 		}
 		r.Reload(newTasks)
-		// Notify the TUI to refresh its tabs and URL bar.
 		if p := tuiProgram.Load(); p != nil {
 			p.Send(tui.ReloadMsg{Labels: r.TaskOrder()})
 		}
-	}); err != nil {
-		fmt.Fprintf(os.Stderr, "[taskr] warning: could not watch tasks.json: %v\n", err)
+	}
+
+	for _, found := range allFoundFiles {
+		fp := found.TasksPath
+		if err := w.WatchConfig(fp, reloadAllConfigs); err != nil {
+			fmt.Fprintf(os.Stderr, "[taskr] warning: could not watch %s: %v\n", fp, err)
+		}
 	}
 
 	// 7. Launch TUI

@@ -21,6 +21,7 @@ const maxLogLines = 10000
 
 type logLineMsg config.LogLine
 type capturedURLMsg runner.CapturedURL
+type tickMsg time.Time
 
 // ReloadMsg is sent to the TUI when tasks.json is reloaded so the tab bar,
 // URL bar and task index are updated to reflect the new set of running tasks.
@@ -70,6 +71,14 @@ var (
 
 	watchIconStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("#00FF7F"))
+
+	hiddenIconStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#FF4500"))
+
+	noResultsStyle = lipgloss.NewStyle().
+			Foreground(lipgloss.Color("#888888")).
+			Italic(true).
+			Padding(1, 2)
 )
 
 // Model is the Bubble Tea model for the taskr TUI.
@@ -106,6 +115,15 @@ type Model struct {
 
 	// Label display (false = compact bullet, true = full names)
 	showLabels bool
+
+	// Deduplication tracking
+	lastLogKey     string    // "label\x00content" of last appended log
+	lastLogContent string    // original content (without count prefix)
+	lastLogCount   int       // how many consecutive duplicates
+	lastLogTime    time.Time // timestamp of  first line in current dedup run
+
+	// Batched rendering
+	pendingLogs int // number of logs received since last tick
 
 	// Terminal dimensions
 	width  int
@@ -169,6 +187,7 @@ func (m Model) Init() tea.Cmd {
 	return tea.Batch(
 		waitForLog(m.runner.LogCh()),
 		waitForURL(m.runner.URLCh()),
+		tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) }),
 	)
 }
 
@@ -279,6 +298,13 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 
+		case "h":
+			if m.activeTab >= 0 {
+				label := m.taskLabels[m.activeTab]
+				m.runner.ToggleHidden(label)
+				m.refreshViewport()
+			}
+
 		case "f":
 			m.follow = !m.follow
 			if m.follow {
@@ -327,11 +353,18 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case logLineMsg:
 		line := config.LogLine(msg)
 		m.appendLog(line)
-		m.refreshViewport()
-		if m.follow {
-			m.viewport.GotoBottom()
-		}
+		m.pendingLogs++
 		cmds = append(cmds, waitForLog(m.runner.LogCh()))
+
+	case tickMsg:
+		if m.pendingLogs > 0 {
+			m.refreshViewport()
+			if m.follow {
+				m.viewport.GotoBottom()
+			}
+			m.pendingLogs = 0
+		}
+		cmds = append(cmds, tea.Tick(50*time.Millisecond, func(t time.Time) tea.Msg { return tickMsg(t) }))
 
 	case ClearURLsMsg:
 		m.clearURLs(msg.Label)
@@ -401,6 +434,29 @@ func (m *Model) resizeViewport() {
 }
 
 func (m *Model) appendLog(line config.LogLine) {
+	// Skip empty/whitespace-only lines
+	if strings.TrimSpace(line.Content) == "" {
+		return
+	}
+
+	// Deduplication: collapse consecutive identical lines from the same task
+	// Only collapse within a 1-minute window
+	key := line.TaskLabel + "\x00" + line.Content
+	if key == m.lastLogKey && len(m.allLogs) > 0 && line.Timestamp.Sub(m.lastLogTime) <= time.Minute {
+		m.lastLogCount++
+		// Update the last log entry's content with the count
+		last := &m.allLogs[len(m.allLogs)-1]
+		last.Content = fmt.Sprintf("(×%d) %s", m.lastLogCount, m.lastLogContent)
+		last.Timestamp = line.Timestamp
+		return
+	}
+
+	// New unique line or dedup window expired
+	m.lastLogKey = key
+	m.lastLogContent = line.Content
+	m.lastLogCount = 1
+	m.lastLogTime = line.Timestamp
+
 	m.allLogs = append(m.allLogs, line)
 	// Ring buffer: if we exceed max, trim the front
 	if len(m.allLogs) > maxLogLines {
@@ -460,6 +516,7 @@ func (m *Model) refreshViewport() {
 func (m *Model) buildLogContent() string {
 	var sb strings.Builder
 	searchLower := strings.ToLower(m.searchQuery)
+	matchCount := 0
 
 	// Label display mode
 	prefixLen := 10 // just bullet + timestamp: "● 15:04:05 "
@@ -477,6 +534,11 @@ func (m *Model) buildLogContent() string {
 			if line.TaskLabel != m.taskLabels[m.activeTab] {
 				continue
 			}
+		}
+
+		// Hide logs for hidden tasks (in ALL view, skip hidden; in tab view the toggle is visible)
+		if m.activeTab == -1 && m.runner.IsHidden(line.TaskLabel) {
+			continue
 		}
 
 		// Format the line
@@ -500,6 +562,13 @@ func (m *Model) buildLogContent() string {
 
 		// Copy mode: show raw content only (no labels/timestamps)
 		if !m.mouseMode {
+			if m.searchQuery != "" {
+				if !strings.Contains(strings.ToLower(content), searchLower) &&
+					!strings.Contains(strings.ToLower(line.Content), searchLower) {
+					continue
+				}
+			}
+			matchCount++
 			sb.WriteString(content)
 			sb.WriteByte('\n')
 			continue
@@ -508,6 +577,13 @@ func (m *Model) buildLogContent() string {
 		// Wrap long content at terminal width
 		maxContentWidth := wrapWidth - prefixLen
 		if maxContentWidth > 0 && len(line.Content) > maxContentWidth {
+			// Filter by search before rendering wrapped lines
+			if m.searchQuery != "" {
+				if !strings.Contains(strings.ToLower(line.Content), searchLower) {
+					continue
+				}
+			}
+			matchCount++
 			lines := wrapText(content, maxContentWidth)
 			padding := strings.Repeat(" ", prefixLen)
 			for i, wl := range lines {
@@ -527,10 +603,16 @@ func (m *Model) buildLogContent() string {
 					continue
 				}
 			}
+			matchCount++
 
 			sb.WriteString(formatted)
 			sb.WriteByte('\n')
 		}
+	}
+
+	// Show "no results" message when search is active but nothing matched
+	if m.searchQuery != "" && matchCount == 0 {
+		return noResultsStyle.Render(fmt.Sprintf("No results for %q", m.searchQuery))
 	}
 
 	return sb.String()
@@ -634,7 +716,7 @@ func (m Model) View() string {
 		labelIcon = "[ab]"
 	}
 	shortcuts := statusBarStyle.Render(
-		fmt.Sprintf(" ←→ task │ r restart │ s stop │ Space watch │ / search │ f follow %s │ l %s │ m %s │ c clear │ q quit ", followIcon, labelIcon, mouseIcon),
+		fmt.Sprintf(" ←→ task │ r restart │ s stop │ Space watch │ h hide │ / search │ f follow %s │ l %s │ m %s │ c clear │ q quit ", followIcon, labelIcon, mouseIcon),
 	)
 	sections = append(sections, shortcuts)
 
@@ -660,7 +742,12 @@ func (m Model) buildTabBar() string {
 			watchIcon = watchIconStyle.Render("👁")
 		}
 
-		tabText := fmt.Sprintf("%s %s%s", label, dot, watchIcon)
+		hideIcon := ""
+		if m.runner.IsHidden(label) {
+			hideIcon = hiddenIconStyle.Render("🔇")
+		}
+
+		tabText := fmt.Sprintf("%s %s%s%s", label, dot, watchIcon, hideIcon)
 
 		if m.activeTab == i {
 			tabs = append(tabs, activeTabStyle.Render(tabText))

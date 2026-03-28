@@ -26,14 +26,15 @@ type CapturedURL struct {
 
 // Runner manages the lifecycle of all tasks.
 type Runner struct {
-	tasks     map[string]*managedTask
-	taskOrder []string
-	logCh     chan config.LogLine
-	urlCh     chan CapturedURL
-	urlReady  chan string // signals task label when first URL is captured
-	mu        sync.Mutex
-	ctx       context.Context
-	cancelAll context.CancelFunc
+	tasks       map[string]*managedTask
+	taskOrder   []string
+	hiddenTasks map[string]bool // per-task log visibility toggle
+	logCh       chan config.LogLine
+	urlCh       chan CapturedURL
+	urlReady    chan string // signals task label when first URL is captured
+	mu          sync.Mutex
+	ctx         context.Context
+	cancelAll   context.CancelFunc
 }
 
 type managedTask struct {
@@ -48,12 +49,13 @@ type managedTask struct {
 func New(configs []config.TaskConfig) *Runner {
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Runner{
-		tasks:     make(map[string]*managedTask),
-		logCh:     make(chan config.LogLine, 1000),
-		urlCh:     make(chan CapturedURL, 100),
-		urlReady:  make(chan string, 10),
-		ctx:       ctx,
-		cancelAll: cancel,
+		tasks:       make(map[string]*managedTask),
+		hiddenTasks: make(map[string]bool),
+		logCh:       make(chan config.LogLine, 1000),
+		urlCh:       make(chan CapturedURL, 100),
+		urlReady:    make(chan string, 10),
+		ctx:         ctx,
+		cancelAll:   cancel,
 	}
 	for _, c := range configs {
 		mt := &managedTask{
@@ -65,6 +67,9 @@ func New(configs []config.TaskConfig) *Runner {
 		}
 		r.tasks[c.Label] = mt
 		r.taskOrder = append(r.taskOrder, c.Label)
+		if c.HideLogs {
+			r.hiddenTasks[c.Label] = true
+		}
 	}
 	return r
 }
@@ -90,6 +95,21 @@ func (r *Runner) GetStatus(label string) config.TaskStatus {
 		return mt.state.GetStatus()
 	}
 	return config.StatusPending
+}
+
+// IsHidden returns whether log output is hidden for the given task.
+func (r *Runner) IsHidden(label string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return r.hiddenTasks[label]
+}
+
+// ToggleHidden flips the hidden state for a task and returns the new state.
+func (r *Runner) ToggleHidden(label string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.hiddenTasks[label] = !r.hiddenTasks[label]
+	return r.hiddenTasks[label]
 }
 
 // StartAll launches all tasks.

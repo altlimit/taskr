@@ -7,6 +7,8 @@ import { execSync, exec } from 'child_process';
 
 const GITHUB_REPO = 'altlimit/taskr';
 const BINARY_NAME = process.platform === 'win32' ? 'taskr.exe' : 'taskr';
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000; // 24 hours
+const LAST_UPDATE_CHECK_KEY = 'taskr.lastUpdateCheck';
 
 interface TaskEntry {
     label: string;
@@ -20,6 +22,9 @@ interface TasksFile {
 }
 
 export function activate(context: vscode.ExtensionContext) {
+    // Fire-and-forget update check on activation
+    checkForUpdates(context);
+
     const command = vscode.commands.registerCommand('taskr.run', async () => {
         const workspaceFolder = vscode.workspace.workspaceFolders?.[0];
         if (!workspaceFolder) {
@@ -27,16 +32,34 @@ export function activate(context: vscode.ExtensionContext) {
             return;
         }
 
-        // 1. Read tasks.json to get labels for the picker
-        const tasksPath = path.join(workspaceFolder.uri.fsPath, '.vscode', 'tasks.json');
-        if (!fs.existsSync(tasksPath)) {
+        // 1. Discover all tasks.json files (root + nested)
+        const wsRoot = workspaceFolder.uri.fsPath;
+        const allFound = findAllTasksJson(wsRoot);
+
+        if (allFound.length === 0) {
             vscode.window.showErrorMessage('TaskR: No .vscode/tasks.json found in workspace');
             return;
         }
 
-        const tasks = readTasksJson(tasksPath);
-        if (!tasks || tasks.length === 0) {
-            vscode.window.showErrorMessage('TaskR: No tasks found in tasks.json');
+        // Parse and merge tasks from all files
+        const tasks: TaskEntry[] = [];
+        for (const found of allFound) {
+            const fileTasks = readTasksJson(found.tasksPath);
+            if (!fileTasks) { continue; }
+            for (const t of fileTasks) {
+                if (found.relPrefix) {
+                    t.label = `${found.relPrefix}/${t.label}`;
+                    if (t.dependsOn) {
+                        const deps = Array.isArray(t.dependsOn) ? t.dependsOn : [t.dependsOn];
+                        t.dependsOn = deps.map(d => `${found.relPrefix}/${d}`);
+                    }
+                }
+                tasks.push(t);
+            }
+        }
+
+        if (tasks.length === 0) {
+            vscode.window.showErrorMessage('TaskR: No tasks found in any tasks.json');
             return;
         }
 
@@ -225,9 +248,77 @@ function readTasksJson(filePath: string): TaskEntry[] | null {
         const parsed: TasksFile = JSON.parse(content);
         return parsed.tasks || [];
     } catch (err) {
-        vscode.window.showErrorMessage(`TaskR: Failed to parse tasks.json: ${err}`);
+        vscode.window.showErrorMessage(`TaskR: Failed to parse ${filePath}: ${err}`);
         return null;
     }
+}
+
+interface FoundTasksJson {
+    tasksPath: string;
+    workspaceRoot: string;
+    relPrefix: string; // empty for root, e.g. "frontend" or "backend/api"
+}
+
+/** Directories to skip when walking for nested tasks.json files. */
+const IGNORED_DIRS = new Set([
+    'node_modules', 'vendor', '__pycache__', '.next', '.nuxt',
+    'dist', 'build', 'target', 'bin', 'obj',
+]);
+
+/**
+ * Recursively discover all .vscode/tasks.json files from the workspace root.
+ * Returns them with the root-level file first (empty prefix), then nested
+ * files with their relative directory as the prefix.
+ */
+function findAllTasksJson(rootDir: string): FoundTasksJson[] {
+    const results: FoundTasksJson[] = [];
+
+    // Check root
+    const rootTasksPath = path.join(rootDir, '.vscode', 'tasks.json');
+    if (fs.existsSync(rootTasksPath)) {
+        results.push({
+            tasksPath: rootTasksPath,
+            workspaceRoot: rootDir,
+            relPrefix: '',
+        });
+    }
+
+    // Walk subdirectories
+    function walk(dir: string): void {
+        let entries: fs.Dirent[];
+        try {
+            entries = fs.readdirSync(dir, { withFileTypes: true });
+        } catch {
+            return;
+        }
+        for (const entry of entries) {
+            if (!entry.isDirectory()) { continue; }
+            const name = entry.name;
+            // Skip hidden dirs except .vscode
+            if (name !== '.vscode' && name.startsWith('.')) { continue; }
+            if (IGNORED_DIRS.has(name)) { continue; }
+
+            const fullPath = path.join(dir, name);
+
+            if (name === '.vscode') {
+                const tasksFile = path.join(fullPath, 'tasks.json');
+                if (fs.existsSync(tasksFile) && tasksFile !== rootTasksPath) {
+                    const wsRoot = path.dirname(fullPath); // parent of .vscode
+                    const rel = path.relative(rootDir, wsRoot).replace(/\\/g, '/');
+                    results.push({
+                        tasksPath: tasksFile,
+                        workspaceRoot: wsRoot,
+                        relPrefix: rel,
+                    });
+                }
+            } else {
+                walk(fullPath);
+            }
+        }
+    }
+
+    walk(rootDir);
+    return results;
 }
 
 /**
@@ -481,6 +572,174 @@ function downloadFile(url: string, dest: string, callback: (err: Error | null) =
         fs.unlink(dest, () => {});
         callback(err);
     });
+}
+
+/**
+ * Check for updated taskr binary in the background.
+ * Throttled to once per UPDATE_CHECK_INTERVAL_MS.
+ */
+async function checkForUpdates(context: vscode.ExtensionContext): Promise<void> {
+    try {
+        const lastCheck = context.globalState.get<number>(LAST_UPDATE_CHECK_KEY, 0);
+        if (Date.now() - lastCheck < UPDATE_CHECK_INTERVAL_MS) {
+            return; // Checked recently, skip
+        }
+
+        // Find the currently installed binary to compare against
+        const currentBinary = findInstalledBinary(context);
+        if (!currentBinary) {
+            return; // No binary installed yet — nothing to update
+        }
+
+        const localVersion = getLocalVersion(currentBinary);
+        if (!localVersion) {
+            return; // Can't determine local version
+        }
+
+        const latestTag = await fetchLatestReleaseTag();
+        if (!latestTag) {
+            return; // Network error or no releases
+        }
+
+        // Record that we checked, regardless of result
+        await context.globalState.update(LAST_UPDATE_CHECK_KEY, Date.now());
+
+        // Compare versions: strip leading 'v' from tag
+        const latestVersion = latestTag.replace(/^v/, '');
+        if (!isNewerVersion(latestVersion, localVersion)) {
+            return; // Already up to date
+        }
+
+        // Prompt the user
+        const goAvailable = !!findOnPath('go');
+        const actions = goAvailable
+            ? ['Update with Go', 'Download Binary', 'Dismiss']
+            : ['Download', 'Dismiss'];
+
+        const choice = await vscode.window.showInformationMessage(
+            `TaskR: A new version is available (${latestVersion}, current: ${localVersion})`,
+            ...actions
+        );
+
+        if (choice === 'Update with Go') {
+            const updated = await goInstall();
+            if (updated) {
+                vscode.window.showInformationMessage(`TaskR: Updated to v${latestVersion}`);
+            }
+        } else if (choice === 'Download Binary' || choice === 'Download') {
+            const storagePath = context.globalStorageUri.fsPath;
+            const updated = await downloadBinary(storagePath);
+            if (updated) {
+                vscode.window.showInformationMessage(`TaskR: Updated to v${latestVersion}`);
+            }
+        }
+    } catch {
+        // Silently ignore — update checks should never block normal usage
+    }
+}
+
+/**
+ * Find the installed binary: PATH first, then extension storage.
+ */
+function findInstalledBinary(context: vscode.ExtensionContext): string | null {
+    const pathBinary = findOnPath(BINARY_NAME);
+    if (pathBinary) {
+        return pathBinary;
+    }
+    const storagePath = context.globalStorageUri.fsPath;
+    const localBinary = path.join(storagePath, BINARY_NAME);
+    if (fs.existsSync(localBinary)) {
+        return localBinary;
+    }
+    return null;
+}
+
+/**
+ * Get the local version by running `taskr -v`.
+ * Expected output: "taskr version 0.1.42"
+ */
+function getLocalVersion(binaryPath: string): string | null {
+    try {
+        const output = execSync(`"${binaryPath}" -v`, {
+            encoding: 'utf-8',
+            timeout: 5000,
+        }).trim();
+        // Parse "taskr version X.Y.Z"
+        const match = output.match(/version\s+(\S+)/);
+        return match ? match[1] : null;
+    } catch {
+        return null;
+    }
+}
+
+/**
+ * Fetch the latest release tag from GitHub.
+ */
+function fetchLatestReleaseTag(): Promise<string | null> {
+    return new Promise((resolve) => {
+        const options = {
+            hostname: 'api.github.com',
+            path: `/repos/${GITHUB_REPO}/releases/latest`,
+            headers: { 'User-Agent': 'vscode-taskr' },
+        };
+
+        const req = https.get(options, (res) => {
+            // Follow redirect
+            if ((res.statusCode === 301 || res.statusCode === 302) && res.headers.location) {
+                https.get(res.headers.location, { headers: options.headers }, (res2) => {
+                    collectBody(res2, resolve);
+                }).on('error', () => resolve(null));
+                return;
+            }
+            collectBody(res, resolve);
+        });
+
+        req.on('error', () => resolve(null));
+        req.setTimeout(10000, () => {
+            req.destroy();
+            resolve(null);
+        });
+    });
+}
+
+function collectBody(res: import('http').IncomingMessage, resolve: (tag: string | null) => void) {
+    if (res.statusCode !== 200) {
+        resolve(null);
+        return;
+    }
+    let body = '';
+    res.on('data', (chunk: Buffer) => { body += chunk.toString(); });
+    res.on('end', () => {
+        try {
+            const data = JSON.parse(body);
+            resolve(data.tag_name || null);
+        } catch {
+            resolve(null);
+        }
+    });
+    res.on('error', () => resolve(null));
+}
+
+/**
+ * Compare two semver-like version strings (e.g. "0.1.50" vs "0.1.42").
+ * Returns true if `latest` is newer than `current`.
+ */
+function isNewerVersion(latest: string, current: string): boolean {
+    // Handle 'dev' builds — always consider them outdated
+    if (current === 'dev') {
+        return true;
+    }
+
+    const latestParts = latest.split('.').map(Number);
+    const currentParts = current.split('.').map(Number);
+
+    for (let i = 0; i < Math.max(latestParts.length, currentParts.length); i++) {
+        const l = latestParts[i] || 0;
+        const c = currentParts[i] || 0;
+        if (l > c) { return true; }
+        if (l < c) { return false; }
+    }
+    return false; // Equal
 }
 
 export function deactivate() {}

@@ -920,6 +920,262 @@ func TestParse_WindowsPathSeparator(t *testing.T) {
 	}
 }
 
+// --- TASKR_HIDE tests ---
+
+func TestParseTaskrEnvOverrides_HideTrue(t *testing.T) {
+	tc := config.TaskConfig{
+		Env: map[string]string{
+			"TASKR_HIDE": "true",
+			"OTHER":      "value",
+		},
+	}
+	parseTaskrEnvOverrides(&tc)
+
+	if !tc.HideLogs {
+		t.Error("HideLogs should be true")
+	}
+	if _, ok := tc.Env["TASKR_HIDE"]; ok {
+		t.Error("TASKR_HIDE should be removed from env")
+	}
+	if tc.Env["OTHER"] != "value" {
+		t.Error("non-TASKR env should be preserved")
+	}
+}
+
+func TestParseTaskrEnvOverrides_HideFalse(t *testing.T) {
+	tc := config.TaskConfig{
+		HideLogs: true, // start as true
+		Env:      map[string]string{"TASKR_HIDE": "false"},
+	}
+	parseTaskrEnvOverrides(&tc)
+
+	if tc.HideLogs {
+		t.Error("HideLogs should be false")
+	}
+	if _, ok := tc.Env["TASKR_HIDE"]; ok {
+		t.Error("TASKR_HIDE should be removed from env")
+	}
+}
+
+func TestParseTaskrEnvOverrides_HideYes(t *testing.T) {
+	tc := config.TaskConfig{
+		Env: map[string]string{"TASKR_HIDE": "yes"},
+	}
+	parseTaskrEnvOverrides(&tc)
+
+	if !tc.HideLogs {
+		t.Error("HideLogs should be true for 'yes'")
+	}
+}
+
+func TestParse_TaskrHideIntegration(t *testing.T) {
+	tasksPath, wsRoot := writeTempTasksJSON(t, `{
+		"version": "2.0.0",
+		"tasks": [
+			{
+				"label": "noisy-task",
+				"command": "echo spam",
+				"options": {
+					"env": { "TASKR_HIDE": "true" }
+				}
+			},
+			{
+				"label": "visible-task",
+				"command": "echo hello"
+			}
+		]
+	}`)
+
+	configs, err := Parse(tasksPath, wsRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(configs) != 2 {
+		t.Fatalf("expected 2 tasks, got %d", len(configs))
+	}
+	if !configs[0].HideLogs {
+		t.Error("noisy-task should have HideLogs=true")
+	}
+	if configs[1].HideLogs {
+		t.Error("visible-task should have HideLogs=false")
+	}
+	// TASKR_HIDE should be consumed from env
+	if _, ok := configs[0].Env["TASKR_HIDE"]; ok {
+		t.Error("TASKR_HIDE should be consumed from env")
+	}
+}
+
+// --- PrefixTasks tests ---
+
+func TestPrefixTasks_Empty(t *testing.T) {
+	tasks := []config.TaskConfig{
+		{Label: "build", Command: "go build"},
+	}
+	PrefixTasks(tasks, "")
+	if tasks[0].Label != "build" {
+		t.Errorf("empty prefix should not change label, got %q", tasks[0].Label)
+	}
+}
+
+func TestPrefixTasks_WithPrefix(t *testing.T) {
+	tasks := []config.TaskConfig{
+		{Label: "build", Command: "go build", DependsOn: []string{"lint"}},
+		{Label: "lint", Command: "golint"},
+	}
+	PrefixTasks(tasks, "frontend")
+
+	if tasks[0].Label != "frontend/build" {
+		t.Errorf("label = %q, want %q", tasks[0].Label, "frontend/build")
+	}
+	if tasks[1].Label != "frontend/lint" {
+		t.Errorf("label = %q, want %q", tasks[1].Label, "frontend/lint")
+	}
+	if tasks[0].DependsOn[0] != "frontend/lint" {
+		t.Errorf("dependsOn = %q, want %q", tasks[0].DependsOn[0], "frontend/lint")
+	}
+}
+
+func TestPrefixTasks_NestedPrefix(t *testing.T) {
+	tasks := []config.TaskConfig{
+		{Label: "serve", Command: "npm start"},
+	}
+	PrefixTasks(tasks, "apps/web")
+	if tasks[0].Label != "apps/web/serve" {
+		t.Errorf("label = %q, want %q", tasks[0].Label, "apps/web/serve")
+	}
+}
+
+// --- FindAllTasksJSON tests ---
+
+func TestFindAllTasksJSON_RootOnly(t *testing.T) {
+	dir := t.TempDir()
+	vscodeDir := filepath.Join(dir, ".vscode")
+	os.MkdirAll(vscodeDir, 0755)
+	os.WriteFile(filepath.Join(vscodeDir, "tasks.json"), []byte(`{}`), 0644)
+
+	results := FindAllTasksJSON(dir)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].RelPrefix != "" {
+		t.Errorf("root should have empty prefix, got %q", results[0].RelPrefix)
+	}
+}
+
+func TestFindAllTasksJSON_Nested(t *testing.T) {
+	dir := t.TempDir()
+
+	// Root tasks.json
+	os.MkdirAll(filepath.Join(dir, ".vscode"), 0755)
+	os.WriteFile(filepath.Join(dir, ".vscode", "tasks.json"), []byte(`{}`), 0644)
+
+	// Nested: frontend/.vscode/tasks.json
+	os.MkdirAll(filepath.Join(dir, "frontend", ".vscode"), 0755)
+	os.WriteFile(filepath.Join(dir, "frontend", ".vscode", "tasks.json"), []byte(`{}`), 0644)
+
+	// Nested: backend/api/.vscode/tasks.json
+	os.MkdirAll(filepath.Join(dir, "backend", "api", ".vscode"), 0755)
+	os.WriteFile(filepath.Join(dir, "backend", "api", ".vscode", "tasks.json"), []byte(`{}`), 0644)
+
+	results := FindAllTasksJSON(dir)
+	if len(results) != 3 {
+		t.Fatalf("expected 3 results, got %d: %+v", len(results), results)
+	}
+
+	// Check prefixes
+	prefixes := map[string]bool{}
+	for _, r := range results {
+		prefixes[r.RelPrefix] = true
+	}
+	if !prefixes[""] {
+		t.Error("missing root prefix (empty)")
+	}
+	if !prefixes["frontend"] {
+		t.Error("missing 'frontend' prefix")
+	}
+	if !prefixes["backend/api"] {
+		t.Error("missing 'backend/api' prefix")
+	}
+}
+
+func TestFindAllTasksJSON_SkipsIgnoredDirs(t *testing.T) {
+	dir := t.TempDir()
+
+	// Root tasks.json
+	os.MkdirAll(filepath.Join(dir, ".vscode"), 0755)
+	os.WriteFile(filepath.Join(dir, ".vscode", "tasks.json"), []byte(`{}`), 0644)
+
+	// Should be skipped: node_modules/.vscode/tasks.json
+	os.MkdirAll(filepath.Join(dir, "node_modules", "pkg", ".vscode"), 0755)
+	os.WriteFile(filepath.Join(dir, "node_modules", "pkg", ".vscode", "tasks.json"), []byte(`{}`), 0644)
+
+	// Should be skipped: .git-something/.vscode/tasks.json (hidden dir)
+	os.MkdirAll(filepath.Join(dir, ".hidden", ".vscode"), 0755)
+	os.WriteFile(filepath.Join(dir, ".hidden", ".vscode", "tasks.json"), []byte(`{}`), 0644)
+
+	results := FindAllTasksJSON(dir)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result (only root), got %d: %+v", len(results), results)
+	}
+}
+
+func TestFindAllTasksJSON_NoRoot(t *testing.T) {
+	dir := t.TempDir()
+	// No .vscode/tasks.json at all
+
+	results := FindAllTasksJSON(dir)
+	if len(results) != 0 {
+		t.Fatalf("expected 0 results, got %d", len(results))
+	}
+}
+
+func TestFindAllTasksJSON_OnlyNested(t *testing.T) {
+	dir := t.TempDir()
+	// No root tasks.json, only nested
+	os.MkdirAll(filepath.Join(dir, "sub", ".vscode"), 0755)
+	os.WriteFile(filepath.Join(dir, "sub", ".vscode", "tasks.json"), []byte(`{}`), 0644)
+
+	results := FindAllTasksJSON(dir)
+	if len(results) != 1 {
+		t.Fatalf("expected 1 result, got %d", len(results))
+	}
+	if results[0].RelPrefix != "sub" {
+		t.Errorf("prefix = %q, want %q", results[0].RelPrefix, "sub")
+	}
+}
+
+// --- ResolveMultipleDependencies with prefixed tasks ---
+
+func TestResolveMultipleDependencies_CrossFile(t *testing.T) {
+	// Simulate tasks from two different tasks.json files merged together
+	rootTasks := []config.TaskConfig{
+		{Label: "api", Command: "go run ./api"},
+	}
+	nestedTasks := []config.TaskConfig{
+		{Label: "lint", Command: "eslint ."},
+		{Label: "dev", Command: "npm run dev", DependsOn: []string{"lint"}},
+	}
+	PrefixTasks(nestedTasks, "frontend")
+
+	allTasks := append(rootTasks, nestedTasks...)
+
+	// Resolve a nested task with dependencies
+	result, err := ResolveMultipleDependencies([]string{"api", "frontend/dev"}, allTasks)
+	if err != nil {
+		t.Fatal(err)
+	}
+	labels := labelList(result)
+	if indexOf(labels, "api") == -1 {
+		t.Error("missing 'api' in resolved tasks")
+	}
+	if indexOf(labels, "frontend/lint") == -1 {
+		t.Error("missing 'frontend/lint' in resolved tasks")
+	}
+	if indexOf(labels, "frontend/dev") == -1 {
+		t.Error("missing 'frontend/dev' in resolved tasks")
+	}
+}
+
 // --- helpers ---
 
 func contains(s, sub string) bool {

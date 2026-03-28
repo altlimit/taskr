@@ -3,6 +3,7 @@ package parser
 import (
 	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -76,6 +77,81 @@ func FindTasksJSON(startDir string) (tasksPath string, workspaceRoot string, err
 		dir = parent
 	}
 	return "", "", fmt.Errorf("could not find .vscode/tasks.json walking up from %s", startDir)
+}
+
+// FoundTasks represents a discovered tasks.json and its workspace root.
+type FoundTasks struct {
+	TasksPath     string
+	WorkspaceRoot string
+	RelPrefix     string // relative path prefix for labels (empty for root)
+}
+
+// FindAllTasksJSON finds all .vscode/tasks.json files recursively from rootDir.
+// The root-level one (if it exists) has an empty RelPrefix; nested ones get a
+// relative directory prefix for label disambiguation.
+func FindAllTasksJSON(rootDir string) []FoundTasks {
+	rootDir, _ = filepath.Abs(rootDir)
+	var results []FoundTasks
+
+	// Check root first
+	rootTasksPath := filepath.Join(rootDir, ".vscode", "tasks.json")
+	if _, err := os.Stat(rootTasksPath); err == nil {
+		results = append(results, FoundTasks{
+			TasksPath:     rootTasksPath,
+			WorkspaceRoot: rootDir,
+		})
+	}
+
+	// Walk subdirectories for nested tasks.json
+	filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil {
+			return nil
+		}
+		if d.IsDir() {
+			name := d.Name()
+			// Skip hidden dirs EXCEPT .vscode (we need to enter it)
+			if name != ".vscode" && strings.HasPrefix(name, ".") {
+				return filepath.SkipDir
+			}
+			if name == "node_modules" || name == "vendor" || name == "__pycache__" ||
+				name == "dist" || name == "build" || name == "target" ||
+				name == "bin" || name == "obj" {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		// Check if this is tasks.json inside a .vscode directory
+		if d.Name() == "tasks.json" && filepath.Base(filepath.Dir(path)) == ".vscode" {
+			absPath, _ := filepath.Abs(path)
+			if absPath == rootTasksPath {
+				return nil // already added as root
+			}
+			wsRoot := filepath.Dir(filepath.Dir(path)) // parent of .vscode
+			rel, _ := filepath.Rel(rootDir, wsRoot)
+			results = append(results, FoundTasks{
+				TasksPath:     path,
+				WorkspaceRoot: wsRoot,
+				RelPrefix:     filepath.ToSlash(rel),
+			})
+		}
+		return nil
+	})
+
+	return results
+}
+
+// PrefixTasks adds a directory prefix to all task labels and their dependsOn
+// references, for disambiguation when merging tasks from multiple tasks.json files.
+func PrefixTasks(tasks []config.TaskConfig, prefix string) {
+	if prefix == "" {
+		return
+	}
+	for i := range tasks {
+		tasks[i].Label = prefix + "/" + tasks[i].Label
+		for j := range tasks[i].DependsOn {
+			tasks[i].DependsOn[j] = prefix + "/" + tasks[i].DependsOn[j]
+		}
+	}
 }
 
 // stripComments removes single-line // comments and trailing commas from
@@ -305,6 +381,16 @@ func parseTaskrEnvOverrides(tc *config.TaskConfig) {
 			}
 		}
 		delete(tc.Env, "TASKR_WATCH_PATHS")
+	}
+
+	if v, ok := tc.Env["TASKR_HIDE"]; ok {
+		switch strings.ToLower(v) {
+		case "true", "1", "yes":
+			tc.HideLogs = true
+		case "false", "0", "no":
+			tc.HideLogs = false
+		}
+		delete(tc.Env, "TASKR_HIDE")
 	}
 }
 

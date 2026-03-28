@@ -60,6 +60,9 @@ type TaskConfig struct {
 	WatchEnabled    bool     // Runtime toggle (can be flipped in TUI)
 	WatchExtensions []string // e.g. [".go", ".html", ".tmpl"]
 	WatchPaths      []string // relative paths to watch (default: workspace root)
+
+	// Display settings
+	HideLogs bool // Hide log output in TUI (task still runs)
 }
 
 // LogLine is a single log entry emitted by a running task.

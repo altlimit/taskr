@@ -318,15 +318,16 @@ func (w *Watcher) WatchConfig(filePath string, onChange func()) error {
 		return err
 	}
 
+	key := "__config__" + filePath
 	tw := &taskWatcher{
-		label:     "__config__",
+		label:     key,
 		fsWatcher: fsw,
 		enabled:   true,
 		done:      make(chan struct{}),
 	}
 
 	w.mu.Lock()
-	w.watchers["__config__"] = tw
+	w.watchers[key] = tw
 	w.mu.Unlock()
 
 	go func() {

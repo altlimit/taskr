@@ -2,6 +2,8 @@ package runner
 
 import (
 	"testing"
+
+	"github.com/altlimit/taskr/config"
 )
 
 // --- URL extraction tests ---
@@ -137,4 +139,77 @@ func repeat(s string, n int) string {
 		result += s
 	}
 	return result
+}
+
+// --- Hidden tasks tests ---
+
+func TestIsHidden_DefaultFalse(t *testing.T) {
+	r := New([]config.TaskConfig{
+		{Label: "api", Command: "go run ."},
+	})
+	if r.IsHidden("api") {
+		t.Error("task should not be hidden by default")
+	}
+}
+
+func TestIsHidden_NonexistentTask(t *testing.T) {
+	r := New([]config.TaskConfig{
+		{Label: "api", Command: "go run ."},
+	})
+	if r.IsHidden("nonexistent") {
+		t.Error("nonexistent task should not be hidden")
+	}
+}
+
+func TestToggleHidden(t *testing.T) {
+	r := New([]config.TaskConfig{
+		{Label: "api", Command: "go run ."},
+	})
+
+	// Toggle on
+	result := r.ToggleHidden("api")
+	if !result {
+		t.Error("first toggle should return true (hidden)")
+	}
+	if !r.IsHidden("api") {
+		t.Error("task should be hidden after toggle")
+	}
+
+	// Toggle off
+	result = r.ToggleHidden("api")
+	if result {
+		t.Error("second toggle should return false (visible)")
+	}
+	if r.IsHidden("api") {
+		t.Error("task should be visible after second toggle")
+	}
+}
+
+func TestHideLogs_ConfigSeeding(t *testing.T) {
+	r := New([]config.TaskConfig{
+		{Label: "noisy", Command: "echo spam", HideLogs: true},
+		{Label: "quiet", Command: "echo hello", HideLogs: false},
+	})
+
+	if !r.IsHidden("noisy") {
+		t.Error("task with HideLogs=true should start hidden")
+	}
+	if r.IsHidden("quiet") {
+		t.Error("task with HideLogs=false should start visible")
+	}
+}
+
+func TestToggleHidden_IndependentTasks(t *testing.T) {
+	r := New([]config.TaskConfig{
+		{Label: "a", Command: "echo a"},
+		{Label: "b", Command: "echo b"},
+	})
+
+	r.ToggleHidden("a")
+	if !r.IsHidden("a") {
+		t.Error("a should be hidden")
+	}
+	if r.IsHidden("b") {
+		t.Error("b should not be affected by toggling a")
+	}
 }
