@@ -1,7 +1,7 @@
 import * as vscode from 'vscode';
 import * as path from 'path';
 import * as fs from 'fs';
-import * as os from 'os';
+
 import * as https from 'https';
 import { execSync, exec } from 'child_process';
 
@@ -381,7 +381,7 @@ function stripJsoncComments(text: string): string {
 /**
  * Resolve the taskr binary path using this priority:
  * 1. Check if `taskr` is already on PATH
- * 2. Check if Go is installed → `go install`
+ * 2. Check extension's local storage for a previously downloaded binary
  * 3. Download pre-built binary from GitHub releases
  */
 async function resolveBinary(context: vscode.ExtensionContext): Promise<string | null> {
@@ -398,27 +398,9 @@ async function resolveBinary(context: vscode.ExtensionContext): Promise<string |
         return localBinary;
     }
 
-    // 3. Try `go install` if Go is available
-    const goPath = findOnPath('go');
-    if (goPath) {
-        const choice = await vscode.window.showInformationMessage(
-            'TaskR binary not found. Install via `go install`?',
-            'Install with Go',
-            'Download Binary',
-            'Cancel'
-        );
-
-        if (choice === 'Install with Go') {
-            return await goInstall();
-        } else if (choice === 'Download Binary') {
-            return await downloadBinary(storagePath);
-        }
-        return null;
-    }
-
-    // 4. No Go available — offer download
+    // 3. Offer to download pre-built binary
     const choice = await vscode.window.showInformationMessage(
-        'TaskR binary not found and Go is not installed. Download pre-built binary?',
+        'TaskR binary not found. Download pre-built binary from GitHub?',
         'Download',
         'Cancel'
     );
@@ -447,39 +429,7 @@ function findOnPath(name: string): string | null {
     return null;
 }
 
-/**
- * Install taskr via `go install`.
- */
-async function goInstall(): Promise<string | null> {
-    return vscode.window.withProgress(
-        { location: vscode.ProgressLocation.Notification, title: 'Installing taskr...' },
-        async () => {
-            return new Promise((resolve) => {
-                exec(
-                    `go install github.com/${GITHUB_REPO}@latest`,
-                    { timeout: 120000 },
-                    (err) => {
-                        if (err) {
-                            vscode.window.showErrorMessage(`TaskR: go install failed: ${err.message}`);
-                            resolve(null);
-                            return;
-                        }
-                        // Find the installed binary in GOPATH/bin or GOBIN
-                        const gobin = process.env.GOBIN || path.join(process.env.GOPATH || path.join(os.homedir(), 'go'), 'bin');
-                        const installed = path.join(gobin, BINARY_NAME);
-                        if (fs.existsSync(installed)) {
-                            vscode.window.showInformationMessage('TaskR: Installed successfully!');
-                            resolve(installed);
-                        } else {
-                            vscode.window.showErrorMessage('TaskR: go install completed but binary not found');
-                            resolve(null);
-                        }
-                    }
-                );
-            });
-        }
-    );
-}
+
 
 /**
  * Download a pre-built binary from GitHub releases.
@@ -611,22 +561,13 @@ async function checkForUpdates(context: vscode.ExtensionContext): Promise<void> 
         }
 
         // Prompt the user
-        const goAvailable = !!findOnPath('go');
-        const actions = goAvailable
-            ? ['Update with Go', 'Download Binary', 'Dismiss']
-            : ['Download', 'Dismiss'];
-
         const choice = await vscode.window.showInformationMessage(
             `TaskR: A new version is available (${latestVersion}, current: ${localVersion})`,
-            ...actions
+            'Update',
+            'Dismiss'
         );
 
-        if (choice === 'Update with Go') {
-            const updated = await goInstall();
-            if (updated) {
-                vscode.window.showInformationMessage(`TaskR: Updated to v${latestVersion}`);
-            }
-        } else if (choice === 'Download Binary' || choice === 'Download') {
+        if (choice === 'Update') {
             const storagePath = context.globalStorageUri.fsPath;
             const updated = await downloadBinary(storagePath);
             if (updated) {

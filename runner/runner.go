@@ -266,6 +266,17 @@ func (r *Runner) startTask(mt *managedTask) {
 		return
 	}
 
+	// Validate working directory exists before starting — the OS gives a
+	// misleading "no such file or directory" for the shell binary when the
+	// real problem is a missing cwd.
+	if cmd.Dir != "" {
+		if _, statErr := os.Stat(cmd.Dir); statErr != nil {
+			r.emitLog(mt.config.Label, "stderr", fmt.Sprintf("[taskr] working directory does not exist: %s", cmd.Dir))
+			mt.state.SetStatus(config.StatusErrored)
+			return
+		}
+	}
+
 	if err := cmd.Start(); err != nil {
 		r.emitLog(mt.config.Label, "stderr", fmt.Sprintf("[taskr] failed to start: %v", err))
 		mt.state.SetStatus(config.StatusErrored)
@@ -483,10 +494,34 @@ func (r *Runner) killTask(mt *managedTask) {
 		mt.cancel()
 	}
 
-	if mt.cmd != nil && mt.cmd.Process != nil {
-		// Kill entire process group/tree
+	if mt.cmd == nil || mt.cmd.Process == nil {
+		return
+	}
+
+	// Step 1: Send graceful signal (SIGTERM on Unix, CTRL_BREAK on Windows)
+	if err := signalProcessGroup(mt.cmd); err != nil {
+		// If signaling fails, go straight to force kill
 		killProcessGroup(mt.cmd)
 		mt.cmd.Wait()
+		return
+	}
+
+	// Step 2: Wait for the process to exit gracefully
+	done := make(chan struct{})
+	go func() {
+		mt.cmd.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Process exited gracefully
+		return
+	case <-time.After(gracefulShutdownTimeout):
+		// Step 3: Force kill after timeout
+		r.emitLog(mt.config.Label, "stderr", "[taskr] process did not exit gracefully, force killing...")
+		killProcessGroup(mt.cmd)
+		<-done // wait for Wait() to complete after kill
 	}
 }
 

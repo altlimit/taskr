@@ -59,13 +59,15 @@ func main() {
 		cwd, _ := os.Getwd()
 		_, workspaceRoot, err = parser.FindTasksJSON(cwd)
 		if err != nil {
-			log.Fatalf("Error: %v\nRun this from a directory with .vscode/tasks.json, or pass --config", err)
+			// No tasks.json found walking up — use cwd as workspace root
+			// and rely on recursive discovery in subdirectories.
+			workspaceRoot = cwd
 		}
 
 		// Discover all .vscode/tasks.json recursively
 		allFoundFiles = parser.FindAllTasksJSON(workspaceRoot)
 		if len(allFoundFiles) == 0 {
-			log.Fatal("No .vscode/tasks.json found in workspace")
+			log.Fatal("No .vscode/tasks.json found in workspace or subdirectories")
 		}
 
 		for _, found := range allFoundFiles {
