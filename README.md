@@ -17,6 +17,14 @@ A terminal-native task runner that reads your existing `.vscode/tasks.json` and 
 
 ## Install
 
+### Using alt
+
+```bash
+alt install altlimit/taskr
+```
+
+*(Requires the [alt](https://github.com/altlimit/alt) package manager)*
+
 ### Go Install
 
 ```bash
