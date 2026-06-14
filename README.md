@@ -91,6 +91,7 @@ taskr auto-detects whether a command needs file watching:
 | `cargo run`, `dotnet run` | Watches `.rs`/`.cs` files |
 | `vite`, `next dev`, `nodemon` | Skipped (has built-in HMR) |
 | `npm run dev`, `yarn dev` | Skipped (assumed own watcher) |
+| `docker compose up` | No watching (special lifecycle handling) |
 | Everything else | No watching by default |
 
 ### Custom Watch Configuration
@@ -116,6 +117,23 @@ Override watch behavior using `TASKR_*` env vars in your tasks.json (VSCode won'
 | `TASKR_WATCH` | Force `"true"` or `"false"`, overrides auto-detection |
 | `TASKR_WATCH_EXTENSIONS` | Comma-separated file extensions to watch |
 | `TASKR_WATCH_PATHS` | Comma-separated relative paths to watch |
+
+## Docker Compose Support
+
+taskr auto-detects `docker compose up` / `docker-compose up` / `podman-compose up` commands and applies special lifecycle handling:
+
+- **No file watching** — docker compose tasks are never auto-watched
+- **Log following** — if services are already running (`docker compose up` exits immediately), taskr automatically starts `docker compose logs -f --tail 50` so you keep seeing output
+- **Graceful stop** — quitting taskr (`q` / `Ctrl+C`) or stopping a task (`s`) runs `docker compose stop` (matching native Ctrl+C behavior — containers are stopped but not removed)
+- **Clean restart** — pressing `r` runs `docker compose down` then re-runs the original `up` command
+
+```json
+{
+  "label": "infra",
+  "type": "shell",
+  "command": "docker compose up"
+}
+```
 
 ## VSCode Extension
 

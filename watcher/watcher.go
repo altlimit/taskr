@@ -70,6 +70,13 @@ func isIgnoredPath(path string) bool {
 // DetectWatchMode inspects a task command and determines the appropriate watch mode.
 // Also sets default watch extensions if not already configured.
 func DetectWatchMode(tc *config.TaskConfig) {
+	// Docker compose tasks never need file watching
+	if tc.DockerCompose {
+		tc.WatchMode = config.WatchNone
+		tc.WatchEnabled = false
+		return
+	}
+
 	// If TASKR_WATCH already set an explicit mode, respect it
 	if tc.WatchMode == config.WatchSelf || tc.WatchMode == config.WatchBuiltin {
 		if tc.WatchMode == config.WatchSelf {
@@ -121,9 +128,9 @@ type OnChange func(label string)
 
 // Watcher manages file watching for multiple tasks.
 type Watcher struct {
-	watchers   map[string]*taskWatcher
-	mu         sync.Mutex
-	debounce   time.Duration
+	watchers map[string]*taskWatcher
+	mu       sync.Mutex
+	debounce time.Duration
 }
 
 type taskWatcher struct {

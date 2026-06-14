@@ -38,11 +38,14 @@ type Runner struct {
 }
 
 type managedTask struct {
-	config config.TaskConfig
-	state  *config.TaskState
-	cmd    *exec.Cmd
-	cancel context.CancelFunc
-	mu     sync.Mutex
+	config          config.TaskConfig
+	state           *config.TaskState
+	cmd             *exec.Cmd
+	cancel          context.CancelFunc
+	logFollowCmd    *exec.Cmd          // docker compose logs -f process
+	logFollowCancel context.CancelFunc // cancel for log follow context
+	logFollowDone   chan struct{}      // closed when the log follow waiter exits
+	mu              sync.Mutex
 }
 
 // New creates a new Runner with the given task configs.
@@ -282,6 +285,7 @@ func (r *Runner) startTask(mt *managedTask) {
 		mt.state.SetStatus(config.StatusErrored)
 		return
 	}
+	startedAt := time.Now()
 	mt.cmd = cmd
 	mt.state.SetStatus(config.StatusRunning)
 	r.emitLog(mt.config.Label, "stdout", fmt.Sprintf("[taskr] started (pid %d)", cmd.Process.Pid))
@@ -314,6 +318,8 @@ func (r *Runner) startTask(mt *managedTask) {
 	go func() {
 		wg.Wait()
 		err := cmd.Wait()
+		elapsed := time.Since(startedAt)
+
 		if err != nil && ctx.Err() == nil {
 			r.emitLog(mt.config.Label, "stderr", fmt.Sprintf("[taskr] exited with error: %v", err))
 			mt.state.SetStatus(config.StatusErrored)
@@ -321,6 +327,11 @@ func (r *Runner) startTask(mt *managedTask) {
 		} else if ctx.Err() != nil {
 			// Cancelled/killed by us
 			mt.state.SetStatus(config.StatusStopped)
+		} else if mt.config.DockerCompose && elapsed < 5*time.Second {
+			// Docker compose up exited quickly with success — services are
+			// likely already running. Follow their logs instead.
+			r.emitLog(mt.config.Label, "stdout", "[taskr] services already running, following logs...")
+			r.startDockerComposeLogs(mt, ctx, env)
 		} else {
 			r.emitLog(mt.config.Label, "stdout", "[taskr] exited successfully")
 			mt.state.SetStatus(config.StatusStopped)
@@ -376,14 +387,21 @@ func (r *Runner) RestartTask(label string) {
 	r.emitLog(label, "stdout", "[taskr] restarting...")
 	mt.state.SetStatus(config.StatusRestarting)
 
-	// Kill existing
-	r.killTask(mt)
+	if mt.config.DockerCompose {
+		// Docker compose: down then up for a clean restart
+		r.stopDockerCompose(mt, "down")
+		time.Sleep(200 * time.Millisecond)
+		go r.startTask(mt)
+	} else {
+		// Kill existing
+		r.killTask(mt)
 
-	// Small delay to let the process fully exit
-	time.Sleep(100 * time.Millisecond)
+		// Small delay to let the process fully exit
+		time.Sleep(100 * time.Millisecond)
 
-	// Restart
-	go r.startTask(mt)
+		// Restart
+		go r.startTask(mt)
+	}
 }
 
 // Reload applies a new set of task configs without restarting the process.
@@ -475,7 +493,11 @@ func (r *Runner) StopTask(label string) {
 		return
 	}
 	r.emitLog(label, "stdout", "[taskr] stopping...")
-	r.killTask(mt)
+	if mt.config.DockerCompose {
+		r.stopDockerCompose(mt, "stop")
+	} else {
+		r.killTask(mt)
+	}
 	mt.state.SetStatus(config.StatusStopped)
 }
 
@@ -529,8 +551,184 @@ func (r *Runner) killTask(mt *managedTask) {
 func (r *Runner) Shutdown() {
 	r.cancelAll()
 	for _, mt := range r.tasks {
-		r.killTask(mt)
+		if mt.config.DockerCompose {
+			r.stopDockerCompose(mt, "stop")
+		} else {
+			r.killTask(mt)
+		}
 	}
 	close(r.logCh)
 	close(r.urlCh)
+}
+
+// resolveComposeCommand returns the compose base command to use for lifecycle
+// subcommands (logs/stop/down) for the given task. If the task command uses
+// podman-compose, it stays on podman-compose. Otherwise it tries "docker compose"
+// (v2 plugin) first, then falls back to "docker-compose" (legacy).
+func resolveComposeCommand(mt *managedTask) (string, []string) {
+	fullCmd := mt.config.Command
+	if len(mt.config.Args) > 0 {
+		fullCmd += " " + strings.Join(mt.config.Args, " ")
+	}
+	if strings.Contains(strings.ToLower(fullCmd), "podman-compose") {
+		return "podman-compose", nil
+	}
+	// Try docker compose (v2 plugin)
+	cmd := exec.Command("docker", "compose", "version")
+	cmd.Dir = mt.config.Cwd
+	if err := cmd.Run(); err == nil {
+		return "docker", []string{"compose"}
+	}
+	// Fallback to docker-compose (legacy)
+	return "docker-compose", nil
+}
+
+// stopDockerCompose neutralizes the original `up` process waiter and any active
+// log follow, then runs the given compose subcommand (e.g. "stop", "down") to
+// bring the services down. Cancelling the task context ensures the original
+// `up` waiter goroutine treats the resulting exit as an intentional stop rather
+// than spuriously starting a log follow.
+func (r *Runner) stopDockerCompose(mt *managedTask, subcmd string) {
+	mt.mu.Lock()
+	if mt.cancel != nil {
+		mt.cancel()
+	}
+	mt.mu.Unlock()
+
+	r.stopDockerComposeLogFollow(mt)
+	r.runDockerComposeCmd(mt, subcmd)
+}
+
+// startDockerComposeLogs spawns `docker compose logs -f --tail 50` and streams
+// its output through the normal log channel. Called when compose up exits
+// quickly because services are already running.
+func (r *Runner) startDockerComposeLogs(mt *managedTask, parentCtx context.Context, env []string) {
+	ctx, cancel := context.WithCancel(parentCtx)
+
+	bin, baseArgs := resolveComposeCommand(mt)
+	args := append(baseArgs, "logs", "-f", "--tail", "50")
+
+	cmd := exec.Command(bin, args...)
+	setProcGroup(cmd)
+	cmd.Dir = mt.config.Cwd
+	cmd.Env = env
+
+	stdout, err := cmd.StdoutPipe()
+	if err != nil {
+		r.emitLog(mt.config.Label, "stderr", fmt.Sprintf("[taskr] failed to start log follow: %v", err))
+		cancel()
+		return
+	}
+	stderr, err := cmd.StderrPipe()
+	if err != nil {
+		r.emitLog(mt.config.Label, "stderr", fmt.Sprintf("[taskr] failed to start log follow: %v", err))
+		cancel()
+		return
+	}
+
+	if err := cmd.Start(); err != nil {
+		r.emitLog(mt.config.Label, "stderr", fmt.Sprintf("[taskr] failed to start log follow: %v", err))
+		cancel()
+		return
+	}
+
+	done := make(chan struct{})
+	mt.mu.Lock()
+	mt.logFollowCmd = cmd
+	mt.logFollowCancel = cancel
+	mt.logFollowDone = done
+	mt.mu.Unlock()
+
+	r.emitLog(mt.config.Label, "stdout", fmt.Sprintf("[taskr] following logs (pid %d)", cmd.Process.Pid))
+
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stdout)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			r.emitLog(mt.config.Label, "stdout", scanner.Text())
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		scanner := bufio.NewScanner(stderr)
+		scanner.Buffer(make([]byte, 0, 64*1024), 1024*1024)
+		for scanner.Scan() {
+			r.emitLog(mt.config.Label, "stderr", scanner.Text())
+		}
+	}()
+
+	go func() {
+		wg.Wait()
+		cmd.Wait()
+		close(done)
+		if ctx.Err() == nil {
+			// Log follow exited on its own (services stopped externally?)
+			r.emitLog(mt.config.Label, "stdout", "[taskr] log follow ended")
+			mt.state.SetStatus(config.StatusStopped)
+		}
+	}()
+}
+
+// stopDockerComposeLogFollow kills any active docker compose log follow process.
+func (r *Runner) stopDockerComposeLogFollow(mt *managedTask) {
+	mt.mu.Lock()
+	lfCmd := mt.logFollowCmd
+	lfCancel := mt.logFollowCancel
+	lfDone := mt.logFollowDone
+	mt.logFollowCmd = nil
+	mt.logFollowCancel = nil
+	mt.logFollowDone = nil
+	mt.mu.Unlock()
+
+	if lfCancel != nil {
+		lfCancel()
+	}
+	// The waiter goroutine in startDockerComposeLogs owns cmd.Wait() and closes
+	// lfDone when it returns; wait on that rather than calling Wait() again
+	// (concurrent Wait on the same process is unsafe).
+	if lfCmd != nil && lfCmd.Process != nil && lfDone != nil {
+		signalProcessGroup(lfCmd)
+		select {
+		case <-lfDone:
+		case <-time.After(3 * time.Second):
+			killProcessGroup(lfCmd)
+			<-lfDone
+		}
+	}
+}
+
+// runDockerComposeCmd runs a docker compose subcommand (e.g. "stop", "down")
+// synchronously in the task's working directory, streaming output to the log.
+func (r *Runner) runDockerComposeCmd(mt *managedTask, subcmd string) {
+	bin, baseArgs := resolveComposeCommand(mt)
+	args := append(baseArgs, subcmd)
+
+	r.emitLog(mt.config.Label, "stdout", fmt.Sprintf("[taskr] running docker compose %s...", subcmd))
+
+	cmd := exec.Command(bin, args...)
+	cmd.Dir = mt.config.Cwd
+
+	// Build environment (same as the task)
+	env := os.Environ()
+	for k, v := range mt.config.Env {
+		env = append(env, fmt.Sprintf("%s=%s", k, v))
+	}
+	cmd.Env = env
+
+	output, err := cmd.CombinedOutput()
+	if len(output) > 0 {
+		for _, line := range strings.Split(strings.TrimSpace(string(output)), "\n") {
+			if line != "" {
+				r.emitLog(mt.config.Label, "stdout", line)
+			}
+		}
+	}
+	if err != nil {
+		r.emitLog(mt.config.Label, "stderr", fmt.Sprintf("[taskr] docker compose %s failed: %v", subcmd, err))
+	} else {
+		r.emitLog(mt.config.Label, "stdout", fmt.Sprintf("[taskr] docker compose %s completed", subcmd))
+	}
 }

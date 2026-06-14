@@ -18,7 +18,7 @@ const (
 type TaskStatus int
 
 const (
-	StatusPending    TaskStatus = iota
+	StatusPending TaskStatus = iota
 	StatusRunning
 	StatusStopped
 	StatusRestarting
@@ -44,13 +44,13 @@ func (s TaskStatus) String() string {
 
 // TaskConfig is the resolved configuration for a single runnable task.
 type TaskConfig struct {
-	Label       string
-	Type        string // "shell" or "process"
-	Command     string
-	Args        []string
-	Cwd         string
-	Env         map[string]string
-	DependsOn   []string
+	Label        string
+	Type         string // "shell" or "process"
+	Command      string
+	Args         []string
+	Cwd          string
+	Env          map[string]string
+	DependsOn    []string
 	DependsOrder string // "parallel" or "sequence"
 	IsBackground bool
 	Group        string
@@ -60,6 +60,9 @@ type TaskConfig struct {
 	WatchEnabled    bool     // Runtime toggle (can be flipped in TUI)
 	WatchExtensions []string // e.g. [".go", ".html", ".tmpl"]
 	WatchPaths      []string // relative paths to watch (default: workspace root)
+
+	// Docker compose
+	DockerCompose bool // Task is a docker compose up command
 
 	// Display settings
 	HideLogs bool // Hide log output in TUI (task still runs)
@@ -75,9 +78,9 @@ type LogLine struct {
 
 // TaskState holds the runtime state for a single managed task.
 type TaskState struct {
-	Config  TaskConfig
-	Status  TaskStatus
-	mu      sync.Mutex
+	Config TaskConfig
+	Status TaskStatus
+	mu     sync.Mutex
 }
 
 func (ts *TaskState) SetStatus(s TaskStatus) {

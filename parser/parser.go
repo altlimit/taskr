@@ -15,9 +15,9 @@ import (
 // --- Raw JSON schema types matching VSCode tasks.json ---
 
 type rawTasksFile struct {
-	Version string        `json:"version"`
-	Tasks   []rawTask     `json:"tasks"`
-	Options *rawOptions   `json:"options,omitempty"`
+	Version string      `json:"version"`
+	Tasks   []rawTask   `json:"tasks"`
+	Options *rawOptions `json:"options,omitempty"`
 }
 
 type rawTask struct {
@@ -335,6 +335,7 @@ func Parse(tasksPath string, workspaceRoot string) ([]config.TaskConfig, error) 
 
 		// Extract TASKR_* overrides from env
 		parseTaskrEnvOverrides(&tc)
+		detectDockerCompose(&tc)
 
 		configs = append(configs, tc)
 	}
@@ -394,6 +395,22 @@ func parseTaskrEnvOverrides(tc *config.TaskConfig) {
 	}
 }
 
+// dockerComposePattern matches docker compose up, docker-compose up, and
+// podman-compose up commands.
+var dockerComposePattern = regexp.MustCompile(`(?i)\b(?:docker[- ]compose|podman-compose)\s+up\b`)
+
+// detectDockerCompose checks if the task command is a docker compose up variant
+// and sets the DockerCompose flag accordingly.
+func detectDockerCompose(tc *config.TaskConfig) {
+	fullCmd := tc.Command
+	if len(tc.Args) > 0 {
+		fullCmd += " " + strings.Join(tc.Args, " ")
+	}
+	if dockerComposePattern.MatchString(fullCmd) {
+		tc.DockerCompose = true
+	}
+}
+
 // ResolveDependencies takes a selected task label, the full list of configs,
 // and returns the flat list of tasks to run (resolving dependsOn recursively).
 // Returns tasks in dependency order.
@@ -447,4 +464,3 @@ func ResolveMultipleDependencies(labels []string, allTasks []config.TaskConfig) 
 
 	return result, nil
 }
-

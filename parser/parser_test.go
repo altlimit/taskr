@@ -93,9 +93,9 @@ func TestStripComments_CommentInsideString(t *testing.T) {
 
 func TestLineCommentIndex(t *testing.T) {
 	tests := []struct {
-		name  string
-		line  string
-		want  int
+		name string
+		line string
+		want int
 	}{
 		{"no comment", `"key": "value"`, -1},
 		{"line comment", `"key": "value" // comment`, 15},
@@ -1173,6 +1173,36 @@ func TestResolveMultipleDependencies_CrossFile(t *testing.T) {
 	}
 	if indexOf(labels, "frontend/dev") == -1 {
 		t.Error("missing 'frontend/dev' in resolved tasks")
+	}
+}
+
+// --- detectDockerCompose tests ---
+
+func TestDetectDockerCompose(t *testing.T) {
+	cases := []struct {
+		name    string
+		command string
+		args    []string
+		want    bool
+	}{
+		{"docker compose v2", "docker compose up", nil, true},
+		{"docker-compose legacy", "docker-compose up", nil, true},
+		{"podman-compose", "podman-compose up", nil, true},
+		{"with flags", "docker compose up -d --build", nil, true},
+		{"command in args", "docker", []string{"compose", "up"}, true},
+		{"uppercase", "DOCKER COMPOSE UP", nil, true},
+		{"compose down is not up", "docker compose down", nil, false},
+		{"unrelated command", "go run ./...", nil, false},
+		{"docker run not compose", "docker run nginx", nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tc := config.TaskConfig{Command: c.command, Args: c.args}
+			detectDockerCompose(&tc)
+			if tc.DockerCompose != c.want {
+				t.Errorf("detectDockerCompose(%q %v) = %v, want %v", c.command, c.args, tc.DockerCompose, c.want)
+			}
+		})
 	}
 }
 
